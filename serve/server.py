@@ -32,6 +32,7 @@ import collections
 import base64
 import hashlib
 import hmac
+import io
 import codecs
 import ctypes
 import json
@@ -175,6 +176,38 @@ def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
         except OSError:
             pass
     return Path(vision_dir) / name
+
+
+IMAGE_CELL = 42          # DeepSeek-V4.1-Flash's vision tower: a patch of 14 x a merge of 3, a cell of a span
+
+
+def deepseek_image_size(width: int, height: int, max_tokens: int = 1024, min_pixels: int = 0) -> tuple:
+    """(width, height, image tokens) for a picture of `width` x `height`, in the tower's own terms
+    (src/dsv41/ds4_vision.cu): both sides a multiple of the patch, a grid of merge-sized cells, and a span of
+    n_h * (n_w + 1) + 2 image tokens (one a cell, then the end of each line).
+
+    The size is the middle of what the tower accepts - the tower's own minimum pixels up to the largest grid the
+    token budget allows - so a picture keeps its shape, costs about half of the most it could, and is enlarged when
+    it is under the minimum (the tower was built for that range).  Its 672-pixel test pictures sit in the same
+    range, and a smaller grid encodes faster for the same answer."""
+    shape = width / height if width > 0 and height > 0 else 1.0
+    grids = []
+    for n_h in range(1, max(2, max_tokens)):
+        for n_w in range(1, max(2, max_tokens)):
+            span = n_h * (n_w + 1) + 2
+            if span > max_tokens:
+                break
+            grids.append((n_w * IMAGE_CELL, n_h * IMAGE_CELL, span))
+    if not grids:
+        return IMAGE_CELL, IMAGE_CELL, 4
+    smallest = min_pixels if min_pixels > 0 else 0
+    fits = [g for g in grids if g[0] * g[1] >= smallest] or grids
+    # the middle of the range: as many pixels as the tower's minimum times the most the token budget allows
+    target = (smallest * max(g[0] * g[1] for g in grids)) ** 0.5 if smallest else max(g[0] * g[1] for g in grids)
+    # the picture's shape first (a stretched picture costs more than a few more pixels), then the middle of the range
+    best = min(fits, key=lambda g: (round(abs(g[0] / g[1] - shape) / shape, 3),
+                                    round(abs(g[0] * g[1] - target) / target, 3), -g[0] * g[1]))
+    return best
 
 
 def write_temporary(path: Path, parts: list) -> None:
@@ -4639,7 +4672,7 @@ class Service:
                 live["state"] = "generating"
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
             live["replicas"] = self.engine.replica_view()
-        engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
+        engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.images_supported(),
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
@@ -4700,7 +4733,7 @@ class Service:
             return round(v / unit, digits) if isinstance(v, (int, float)) else None
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
-        images = self.vision is not None
+        images = self.images_supported()
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
@@ -4818,6 +4851,74 @@ class Service:
             self.prompts.forget(ids)
 
 
+    def images_supported(self) -> bool:
+        """Whether this server can read pictures: through the encoder (the Qwen path), or through the engine's own
+        vision tower (DeepSeek-V4.1-Flash, which encodes them itself and needs no second process)."""
+        return self.vision is not None or self.native_vision() is not None
+
+    def native_vision(self) -> dict | None:
+        """The engine's own vision tower, from the INFO line it prints when it starts (strata-dsv41): the token its
+        spans are made of and the tower's limits.  None: no tower - a pack without one, or --vision off."""
+        info = getattr(self.engine, "info", None) or {}
+        try:
+            token = int(info.get("image_token", -1))
+        except (TypeError, ValueError):
+            return None
+        if not info.get("vision") or token < 0:
+            return None
+
+        def number(key, default):
+            try:
+                return int(float(info.get(key, default)))
+            except (TypeError, ValueError):
+                return default
+        return {"image_token": token, "max_tokens": number("vision_max_tokens", 1024),
+                "min_pixels": number("vision_min_pixels", 0)}
+
+    def native_pictures(self, ids, sources, tower, cancel):
+        """The prompt's pictures for an engine that reads them itself (strata-dsv41): every image token the template
+        wrote becomes the span the tower will produce for that picture, and the pixels go into one DSI1 file beside
+        the request - both sides a multiple of the patch, as the tower requires (src/dsv41/ds4_vision.cu).  run()
+        sends that file on the GENI line and deletes it, so the request leaves nothing behind."""
+        from PIL import Image, ImageOps            # (Pillow is a runtime package; the encoder path resizes with it too)
+        pictures, spans, starts = [], [], []
+        for src in sources:
+            if cancel is not None and cancel.is_set():
+                raise ClientGone()
+            data = Vision.load(src)                 # data: URL, http(s) URL or a local file - the encoder's own rules
+            try:
+                with Image.open(io.BytesIO(data)) as opened:
+                    picture = ImageOps.exif_transpose(opened).convert("RGB")   # a phone's turned photo, upright
+                    width, height, span = deepseek_image_size(picture.width, picture.height, tower["max_tokens"],
+                                                              tower["min_pixels"])
+                    picture = picture.resize((width, height), Image.LANCZOS)
+                    pictures.append((width, height, picture.tobytes()))
+            except (OSError, ValueError, Image.DecompressionBombError) as e:
+                raise ValueError(f"the picture could not be read ({e})") from None
+            spans.append(span)
+        out, seen = [], 0
+        for token in ids:
+            if token == tower["image_token"]:
+                if seen >= len(spans):
+                    raise ValueError("the prompt and its pictures do not match")
+                starts.append(len(out))             # where this picture's span begins in the prompt
+                out += [token] * spans[seen]
+                seen += 1
+            else:
+                out.append(token)
+        if seen != len(spans):
+            raise ValueError("the prompt and its pictures do not match")
+        path = combined_embeddings_path(Path(tempfile.gettempdir()),
+                                        sum(len(rgb) for _, _, rgb in pictures) + 64)
+        self.embeddings.path = path                 # first: run() sends it on the GENI line and deletes it after
+        self.embeddings.keys = None
+        with open(path, "wb") as f:
+            f.write(b"DSI1" + struct.pack("<i", len(pictures)))
+            for (width, height, rgb), start in zip(pictures, starts):
+                f.write(struct.pack("<qii", start, width, height))
+                f.write(rgb)
+        return out
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
@@ -4834,49 +4935,54 @@ class Service:
         if images:
             if self.offline and any(src.startswith(("http://", "https://")) for src in images):
                 raise ValueError("offline mode cannot download an image URL; send a data: image instead")
-            if self.vision is None:
+            tower = self.native_vision() if self.vision is None else None
+            if self.vision is None and tower is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
-            # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
-            # for as long as urlopen waited.
-            def fetch(src):
-                if cancel is not None and cancel.is_set():
-                    raise ClientGone()
-                return fetched[src] if src in fetched else Vision.download(src) \
-                    if src.startswith(("http://", "https://")) else src
-            images = [fetch(src) for src in images]
-            # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
-            # run on the GPU at the same time - an encode during a running request left that request stuck at
-            # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
-            # same FIFO as the requests.
-            with self._turn(cancel):
-                self._vision_up()
-                try:
-                    encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
-                               else [self.vision.encode(src) for src in images])
-                finally:
-                    self.last_image_at = time.time()
-            # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
-            # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
-            # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
-            out, k = [], 0
-            for j, t in enumerate(ids):
-                if t == pad and j > 0 and ids[j - 1] == start:
-                    # more pairs than images: text parts that cut both markers apart (the literal marks keep whole ones text)
-                    if k == len(encoded):
-                        raise ValueError("the prompt and its images do not match")
-                    out += [pad] * encoded[k][1]
-                    k += 1
-                elif t == pad:
-                    out += literal
-                else:
-                    out.append(t)
-            if k != len(encoded):
-                raise ValueError("the prompt and its images do not match")
-            ids = out
+            if tower is not None:               # the engine's own tower: no encoder, no second process
+                ids = self.native_pictures(ids, images, tower, cancel)
+                self.last_image_at = time.time()
+            else:
+                pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
+                start = self.tok.encode(VISION_START, parse_special=True)[0]
+                # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
+                # for as long as urlopen waited.
+                def fetch(src):
+                    if cancel is not None and cancel.is_set():
+                        raise ClientGone()
+                    return fetched[src] if src in fetched else Vision.download(src) \
+                        if src.startswith(("http://", "https://")) else src
+                images = [fetch(src) for src in images]
+                # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
+                # run on the GPU at the same time - an encode during a running request left that request stuck at
+                # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
+                # same FIFO as the requests.
+                with self._turn(cancel):
+                    self._vision_up()
+                    try:
+                        encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
+                                   else [self.vision.encode(src) for src in images])
+                    finally:
+                        self.last_image_at = time.time()
+                # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
+                # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
+                # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
+                literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+                out, k = [], 0
+                for j, t in enumerate(ids):
+                    if t == pad and j > 0 and ids[j - 1] == start:
+                        # more pairs than images: text parts that cut both markers apart (the literal marks keep whole ones text)
+                        if k == len(encoded):
+                            raise ValueError("the prompt and its images do not match")
+                        out += [pad] * encoded[k][1]
+                        k += 1
+                    elif t == pad:
+                        out += literal
+                    else:
+                        out.append(t)
+                if k != len(encoded):
+                    raise ValueError("the prompt and its images do not match")
+                ids = out
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
@@ -4907,10 +5013,11 @@ class Service:
             print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) leaves that much "
                   f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
             max_new = max(1, room)          # a shorter completion beats a 400 (the default)
-        if images:
+        if images and self.vision is not None:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
             # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
+            # (The engine's own tower needs no encoder file: native_pictures() wrote its pictures already.)
             combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
             self.embeddings.path = combined             # first, so a half-written one is found as well
             # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
@@ -6635,7 +6742,7 @@ def make_handler(svc: Service):
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
-                                 "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                 "images": svc.images_supported(), "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path.startswith("/v1/images/files/"):
